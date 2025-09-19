@@ -2,12 +2,13 @@
 segmentation.py
 Floor segmentation utilities: heuristic and model-based.
 """
-
+import os
 import cv2
 import numpy as np
 import torch
 import torchvision.transforms as T
 from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
 
 # ----------------------------
 # Heuristic Segmentation
@@ -89,18 +90,38 @@ def model_floor_mask(img_bgr: np.ndarray, device: str = "cpu", model=None) -> np
 # ----------------------------
 # Utility: Load external mask
 # ----------------------------
-def load_binary_mask(path: str, target_shape=None) -> np.ndarray:
+def load_binary_mask(path, target_shape=None) -> np.ndarray:
     """
-    Load a binary mask from file and optionally resize.
+    Load a binary mask from file path OR file-like object (Streamlit uploader).
+    Optionally resize to target_shape.
     """
-    mask = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    mask = None
+
+    # Case 1: path is a string/Path (normal file on disk)
+    if isinstance(path, (str, bytes, os.PathLike)):
+        mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+
+    # Case 2: path is a file-like object (e.g. Streamlit upload)
+    else:
+        try:
+            file_bytes = np.asarray(bytearray(path.read()), dtype=np.uint8)
+            mask = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+        finally:
+            path.seek(0)  # reset pointer for Streamlit
+
     if mask is None:
         raise ValueError("Mask file not found or unreadable")
 
+    # Ensure binary (0/255)
     _, mask_bin = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
+
+    # Resize if needed
     if target_shape is not None:
-        mask_bin = cv2.resize(mask_bin, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask_bin = cv2.resize(mask_bin, (target_shape[1], target_shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+
     return mask_bin
+
 
 # ----------------------------
 # Unified Entry Point
@@ -144,3 +165,51 @@ class FloorSegModel:
         Predict floor mask using DeepLabV3.
         """
         return model_floor_mask(img_bgr, device=self.device, model=self.model)
+    
+#------------------------------------
+# SAM (Meta's Segment Anything Model)
+#------------------------------------
+class SAMRefiner:
+    def __init__(self, model_type="vit_b", checkpoint="sam_vit_b.pth", device=None):
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[SAM] Initializing with {model_type} on {self.device}")
+
+        sam = sam_model_registry[model_type](checkpoint=checkpoint)
+        sam.to(device=self.device)
+        self.mask_generator = SamAutomaticMaskGenerator(sam)
+
+    def refine(self, image_bgr: np.ndarray, rough_mask: np.ndarray) -> np.ndarray:
+        """
+        Refine a rough floor mask using SAM.
+        Returns a binary mask.
+        """
+        import cv2, numpy as np
+
+        # Convert to RGB
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+        # Generate masks
+        masks = self.mask_generator.generate(image_rgb)
+        if not masks:
+            print("[SAM] No masks generated, returning rough mask")
+            return rough_mask
+
+        # Find SAM mask overlapping most with rough mask
+        best_iou, best_mask = 0, None
+        rough_bool = rough_mask > 0
+        for m in masks:
+            sam_mask = m["segmentation"]
+            intersection = np.logical_and(rough_bool, sam_mask).sum()
+            union = np.logical_or(rough_bool, sam_mask).sum()
+            if union == 0:
+                continue
+            iou = intersection / union
+            if iou > best_iou:
+                best_iou, best_mask = iou, sam_mask
+
+        if best_mask is None:
+            print("[SAM] No overlapping mask found, returning rough mask")
+            return rough_mask.astype(np.uint8) * 255
+
+        print(f"[SAM] Refinement successful, IoU={best_iou:.3f}")
+        return (best_mask.astype(np.uint8)) * 255

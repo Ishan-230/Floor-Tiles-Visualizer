@@ -6,6 +6,7 @@ import streamlit as st
 from PIL import Image
 import torch
 
+from floorseg.segmentation import SAMRefiner
 from floorseg.segmentation import (
     heuristic_floor_mask_bgr,
     load_binary_mask,
@@ -17,6 +18,9 @@ from floorseg.visualize import (
     apply_texture_overlay,
     overlay_mask_outline,
 )
+from floorseg.warp_and_blend import warp_and_blend_texture  # <-- NEW import
+
+sam_refiner = SAMRefiner(checkpoint="sam_vit_b.pth")
 
 st.set_page_config(page_title="Floor Color Visualizer", page_icon="🧰", layout="wide")
 st.title("🧰 Floor Color Visualizer")
@@ -38,12 +42,14 @@ with col_input:
 
 # --- Options ---
 with col_opts:
-    mode = st.radio("Overlay mode", ["Colour", "Texture"], horizontal=True)
+    mode = st.radio("Overlay mode", ["Colour", "Texture", "Warp+Blend"], horizontal=True)
     if mode == "Colour":
         colour = st.color_picker("Pick a colour", value="#a37b4b")
         strength = st.slider("Colour strength (saturation blend)", 0.1, 1.0, 0.7, 0.05)
-    else:
+    elif mode == "Texture":
         st.info("Tip: use a seamless wood/tile texture for best results")
+    else:
+        st.info("Warp+Blend projects the texture realistically onto the detected floor.")
 
     seg_method = st.radio("Segmentation method", ["Heuristic", "Model"], horizontal=True)
     use_gpu = st.checkbox("Use GPU (CUDA)", value=False, disabled=not torch.cuda.is_available())
@@ -83,11 +89,17 @@ else:
                 img_bgr, method="model", model=st.session_state.floor_model
             )
 
-# If mask empty, warn and still continue
-if np.count_nonzero(floor_mask) == 0:
-    st.warning(
-        "Floor mask is empty — detection failed. Try uploading a manual mask or a clearer photo."
-    )
+# --- Refine with SAM if available ---
+if floor_mask is not None and np.count_nonzero(floor_mask) > 0:
+    try:
+        sam_refiner = SAMRefiner(checkpoint="sam_vit_b.pth")
+        floor_mask = sam_refiner.refine(img_bgr, floor_mask)
+    except Exception as e:
+        st.warning(f"SAM refinement skipped: {e}")
+
+# --- Empty mask check ---
+if floor_mask is None or np.count_nonzero(floor_mask) == 0:
+    st.warning("Floor mask is empty — detection failed. Try uploading a manual mask or a clearer photo.")
 
 # --- Prepare display versions (resize) ---
 h, w = img_bgr.shape[:2]
@@ -95,9 +107,7 @@ max_w = 1280
 scale = 1.0
 if resize_preview and w > max_w:
     scale = max_w / w
-    img_bgr_disp = cv2.resize(
-        img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA
-    )
+    img_bgr_disp = cv2.resize(img_bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     mask_disp = cv2.resize(
         floor_mask,
         (img_bgr_disp.shape[1], img_bgr_disp.shape[0]),
@@ -117,7 +127,8 @@ if mode == "Colour":
     b = int(hex_val[4:6], 16)
     colour_bgr = (b, g, r)
     result_bgr = apply_colour_overlay(img_bgr, floor_mask, colour_bgr, strength=strength)
-else:
+
+elif mode == "Texture":
     if texture_up is None:
         st.warning("Upload a texture image to use Texture mode.")
         result_bgr = img_bgr.copy()
@@ -130,24 +141,35 @@ else:
         else:
             result_bgr = apply_texture_overlay(img_bgr, floor_mask, texture_bgr)
 
+elif mode == "Warp+Blend":
+    if texture_up is None:
+        st.warning("Upload a texture image to use Warp+Blend mode.")
+        result_bgr = img_bgr.copy()
+    else:
+        tex_bytes = np.frombuffer(texture_up.read(), np.uint8)
+        texture_bgr = cv2.imdecode(tex_bytes, cv2.IMREAD_COLOR)
+        if texture_bgr is None:
+            st.warning("Could not read texture file. Showing original image.")
+            result_bgr = img_bgr.copy()
+        else:
+            result_bgr = warp_and_blend_texture(img_bgr, floor_mask, texture_bgr)  # NEW
+
 # --- Display UI ---
 left, right = st.columns(2)
 with left:
     st.subheader("Original")
     if show_outline:
-        out_orig = overlay_mask_outline(
-            img_bgr_disp, mask_disp, colour=(0, 255, 255)
-        )
+        out_orig = overlay_mask_outline(img_bgr_disp, mask_disp, colour=(0, 255, 255))
         st.image(
             cv2.cvtColor(out_orig, cv2.COLOR_BGR2RGB),
             caption="Original + Detected Floor",
-            use_column_width=True,
+            use_container_width=True,
         )
     else:
         st.image(
             cv2.cvtColor(img_bgr_disp, cv2.COLOR_BGR2RGB),
             caption="Original",
-            use_column_width=True,
+            use_container_width=True,
         )
 
 with right:
@@ -163,7 +185,7 @@ with right:
     st.image(
         cv2.cvtColor(res_disp, cv2.COLOR_BGR2RGB),
         caption=f"{mode} preview",
-        use_column_width=True,
+        use_container_width=True,
     )
 
 # --- Download final PNG ---
